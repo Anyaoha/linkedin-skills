@@ -4,7 +4,15 @@ Your voice, niche, and rules in one place. Fill this once (or let
 `linkedin-humanizer` build it from a few of your real posts), and every writing
 skill in this bundle reads it before drafting, so you stop re-explaining who you
 are on every request. This file is yours: edit it freely, keep it as long or
-short as you like. Nothing here is sent anywhere; it just steers the drafts.
+short as you like. Nothing here is sent to us or to any service; it only steers
+the drafts.
+
+> **It is a file in this repository, though, so git can carry it.** If you
+> cloned or forked this repo and you push, a filled profile goes wherever you
+> push it, including a public fork. Either add `references/voice-profile.md` to
+> your `.gitignore`, or keep the filled copy outside the repo and paste it in
+> when you need it. The shipped template is empty; what you add is yours to
+> protect.
 
 Skills only load this profile when `filled: yes` below. An empty template is
 ignored, so drafts fall back to the generic voice rules until you populate it.
@@ -60,6 +68,8 @@ on-brand via a pixel-exact overlay. All optional; leave blank to skip the overla
 
 - Handle to stamp on images: (e.g. @yourname)
 - Brand color (hex): (e.g. #0A66C2)
-- Logo: (path or Pixfaro `logo_id`, if you have one)
+- Logo: (path or Pixfaro `logo_id`, if you have one — a path can be uploaded
+  once with `lib.brand_logo(path)`, which returns the `logo_id` to record here)
 - Overlay position: (e.g. bottom-right)
 - Visual style default: (e.g. minimal flat vector; bold editorial; muted photo)
+- Card style: (quote-card `style` — "brand", "auto", or a fixed palette/font)

@@ -9,13 +9,25 @@ Auth: PIXFARO_TOKEN env var (or constructor arg). Key format `pf_live_...`.
 Without a token the skills fall back to "manual" mode: they draft the image
 prompt and ask you to generate it yourself and paste the URL.
 
-Endpoint (OpenAI-SDK-compatible):
+Endpoints (OpenAI-SDK-compatible):
   POST https://api.pixfaro.com/v1/images/generations
     body: {model, prompt, aspect_ratio "w:h", resolution "1K|2K|4K", overlay}
     overlay: {text|logo_id, position, opacity, font, color}  # pixel-exact
              composite, NOT model-generated text — so a cheap base model plus
-             an overlay renders crisp quote-cards / thumbnails at low cost.
+             an overlay renders crisp feed images / thumbnails at low cost.
     resp: {id, url, cost, balance_after}   # hosted URL, not base64
+  GET  /v1/key — "does this key work?": {key: {name, prefix, last4, scope},
+    email_verified, balance?}. Any scope, free. THE way to verify a token —
+    /v1/models is public and answers 200 to a wrong key.
+  There is no /v1/render, /v1/templates/<id>, /v1/me, /v1/account or
+  /v1/chat/completions — the endpoints on this page are the whole surface.
+  POST /v1/renders — design templates (quote-card, post-card): typeset HTML,
+    not a model generation, so text is always crisp. Same resp shape.
+  GET  /v1/templates — live template catalog (public). Slots, sizes, price.
+  POST /v1/logos — one-time brand-logo upload (PNG ≤1MB); the returned
+    `logo_id` plugs into `overlay.logo_id`. Needs a FULL-scope key (a
+    generate-scope key gets 403 insufficient_scope — upload in the dashboard
+    instead).
 
 Models (id / median latency / $ per image):
   gemini-flash-lite  3.0s   $0.041   (high-volume, cheap)
@@ -27,6 +39,7 @@ Caching: in-process LRU (128 entries, 6h TTL). Pass `force_refresh=True` to
 bypass. Retries on transient 408/429/5xx (3 attempts, exponential backoff).
 """
 from __future__ import annotations
+import base64
 import json
 import os
 import random
@@ -53,6 +66,10 @@ KNOWN_MODELS = ("gemini-flash-lite", "nano-banana-2", "gemini-pro-image", "gpt-5
 RETRYABLE_STATUSES = {408, 429, 500, 502, 503, 504}
 CACHE_MAX_ENTRIES = 128
 CACHE_TTL_SECONDS = 6 * 60 * 60
+
+# Server-side logo constraints (mirrored so a bad upload fails fast + free):
+# transparent PNG only, ≤1MB decoded, ≤2048px per side, ≤10 live per account.
+MAX_LOGO_BYTES = 1_048_576
 
 
 def _retry(attempts: int = 3, base_delay: float = 0.6):
@@ -84,7 +101,7 @@ class PixfaroClient:
         if not self.api_key:
             raise PixfaroError(
                 "No Pixfaro API key. Set PIXFARO_TOKEN (pf_live_...) or pass api_key. "
-                "Sign up at https://pixfaro.com."
+                "Sign up at https://api.pixfaro.com/signup?ref=linkedin-skills."
             )
         self.timeout = timeout
         self._session = requests.Session()
@@ -203,6 +220,21 @@ class PixfaroClient:
         return data
 
     @_retry()
+    def whoami(self) -> dict[str, Any]:
+        """GET /v1/key — verify the configured key (any scope, free).
+
+        Returns {key: {name, prefix, last4, scope, created_at}, email_verified,
+        balance?} — `balance` only for full-scope keys. A wrong or truncated
+        key raises PixfaroError(status_code=401) with Pixfaro's own message
+        ("shown once at creation: copy it fully, or mint a new one")."""
+        url = f"{BASE_URL}/key"
+        try:
+            r = self._session.get(url, headers=self._headers(), timeout=self.timeout)
+        except requests.RequestException as e:
+            raise PixfaroError(f"request failed: {e}", retryable=True) from e
+        return self._handle(r)
+
+    @_retry()
     def list_models(self) -> list[dict[str, Any]]:
         """GET /v1/models — live model catalog + per-tier pricing."""
         url = f"{BASE_URL}/models"
@@ -213,12 +245,124 @@ class PixfaroClient:
         out = self._handle(r)
         return out.get("data", out) if isinstance(out, dict) else out
 
+    @_retry()
+    def list_templates(self) -> list[dict[str, Any]]:
+        """GET /v1/templates — live design-template catalog.
+
+        Each entry: {id, name, best_for, sizes, slots: [{name, type, required,
+        max?, hint}], styles, price}. Public (no billing), so safe to call
+        before offering a card to the user.
+        """
+        out = self._get("/templates")
+        return out.get("templates", out) if isinstance(out, dict) else out
+
+    @_retry()
+    def render(
+        self,
+        template: str,
+        slots: dict[str, Any],
+        *,
+        size: Optional[str] = None,
+        scale: Optional[int] = None,
+        style: Optional[Any] = None,
+        overlay: Optional[Any] = None,
+        force_refresh: bool = False,
+    ) -> dict[str, Any]:
+        """POST /v1/renders — typeset a design template to a hosted PNG.
+
+        A render is billed and returned exactly like a generation
+        ({id, url, cost, balance_after}) but the text is HTML-typeset, never
+        model-drawn — a quote-card headline comes out crisp every time.
+
+        Args:
+            template: Template id from `list_templates` (e.g. "quote-card").
+            slots: Slot values, e.g. {"quote": "...", "handle": "@me",
+                "avatar": "default"}. Text slots for name/handle also accept
+                "default" to pull from the account's brand identity.
+            size: One of the template's size ids (e.g. "1:1", "4:5", "16:9",
+                "og"); server default when omitted.
+            scale: Raster density 1|2|3 (default 2; 3 bills a small surcharge).
+            style: "auto" (rotates looks), "brand" (account palette), or an
+                explicit {palette, font, layout, shadow} dict.
+            overlay: Same corner-overlay contract as `generate`, or "default"
+                for the account's saved brand kit.
+        """
+        if not template or not str(template).strip():
+            raise PixfaroError("template id cannot be empty — see list_templates()")
+        if not isinstance(slots, dict) or not slots:
+            raise PixfaroError("slots must be a non-empty dict of slot values")
+
+        payload: dict[str, Any] = {"template": template, "slots": slots}
+        if size:
+            payload["size"] = size
+        if scale is not None:
+            payload["scale"] = scale
+        if style is not None:
+            payload["style"] = style
+        if overlay is not None:
+            payload["overlay"] = overlay
+
+        key = "render:" + json.dumps(payload, sort_keys=True)
+        if not force_refresh:
+            cached = self._cache_get(key)
+            if cached is not None:
+                return cached
+
+        data = self._post("/renders", payload)
+        self._cache_put(key, data)
+        return data
+
+    def upload_logo(self, path: str, *, name: Optional[str] = None) -> dict[str, Any]:
+        """POST /v1/logos — one-time brand-logo upload.
+
+        Returns {id: "logo_...", name, width, height, ...}. Save the id in the
+        Voice & Brand Profile §6; from then on every `overlay` can carry
+        `logo_id` instead of text. Constraints (checked server-side too):
+        transparent PNG, ≤1MB, ≤2048px per side, ≤10 logos per account.
+
+        Needs a FULL-scope key: a generate-scope key gets HTTP 403
+        (insufficient_scope) — upload once in the dashboard instead.
+
+        Deliberately NOT retried: a retry racing a slow success would store a
+        duplicate and burn one of the 10 logo slots.
+        """
+        try:
+            with open(path, "rb") as f:
+                raw = f.read()
+        except OSError as e:
+            raise PixfaroError(f"cannot read logo file: {e}") from e
+        if not raw:
+            raise PixfaroError("logo file is empty")
+        if len(raw) > MAX_LOGO_BYTES:
+            raise PixfaroError("logo must be ≤ 1 MB — export a smaller PNG")
+        if raw[:8] != b"\x89PNG\r\n\x1a\n":
+            raise PixfaroError("logo must be a transparent PNG (the file is not a PNG)")
+
+        payload: dict[str, Any] = {"image": base64.b64encode(raw).decode("ascii")}
+        if name:
+            payload["name"] = name
+        return self._post("/logos", payload)
+
+    @_retry()
+    def list_logos(self) -> list[dict[str, Any]]:
+        """GET /v1/logos — this account's uploaded logos (full-scope key)."""
+        out = self._get("/logos")
+        return out.get("logos", out) if isinstance(out, dict) else out
+
     # ---- internals ----
     def _headers(self) -> dict[str, str]:
         return {
             "Authorization": f"Bearer {self.api_key}",
             "Content-Type": "application/json",
         }
+
+    def _get(self, path: str) -> dict[str, Any]:
+        url = f"{BASE_URL}{path}"
+        try:
+            r = self._session.get(url, headers=self._headers(), timeout=self.timeout)
+        except requests.RequestException as e:
+            raise PixfaroError(f"request failed: {e}", retryable=True) from e
+        return self._handle(r)
 
     def _post(self, path: str, json_body: dict[str, Any]) -> dict[str, Any]:
         url = f"{BASE_URL}{path}"

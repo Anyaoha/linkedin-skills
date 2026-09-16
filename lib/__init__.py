@@ -22,6 +22,10 @@ from .backend_selector import (
     illustrate_set,
     refine,
     available_models,
+    card,
+    quote_card,
+    available_templates,
+    brand_logo,
 )
 
 # The three HTTP clients import `requests`, which manual-tier users are not
@@ -67,4 +71,8 @@ __all__ = [
     "illustrate_set",
     "refine",
     "available_models",
+    "card",
+    "quote_card",
+    "available_templates",
+    "brand_logo",
 ]

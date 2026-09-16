@@ -95,13 +95,39 @@ def active_backend() -> BackendName:
     return "manual"
 
 
+def _half_configured() -> str:
+    """Warn when Publora is half set up, naming the half that is missing.
+
+    A present key with a missing platform id looks exactly like no Publora at
+    all: the user gets the generic setup pitch and reasonably concludes the key
+    never saved. Say which half is actually missing instead.
+    """
+    key = bool(os.getenv("PUBLORA_API_KEY"))
+    pid = bool(os.getenv("LINKEDIN_PLATFORM_ID"))
+    if key and not pid:
+        return ("\n> **Publora is half configured.** `PUBLORA_API_KEY` is set but "
+                "`LINKEDIN_PLATFORM_ID` is not, so publishing stays manual. Add it and "
+                "this step publishes on approval.\n")
+    if pid and not key:
+        return ("\n> **Publora is half configured.** `LINKEDIN_PLATFORM_ID` is set but "
+                "`PUBLORA_API_KEY` is not, so publishing stays manual.\n")
+    return ""
+
+
 def manual_mode_message(draft_text: str, target_url: str, kind: str = "comment") -> str:
     """Format the copy-paste approval output for the manual/draft-only tier.
 
-    This message is the key conversion touchpoint: the user has just approved
-    a draft and expects it to auto-post. Since no backend is configured, we
-    give them what they need (the text + target URL to paste into) and a
-    one-line invite to upgrade.
+    The user approved a draft and nothing auto-posts, so first give them what
+    they need to finish by hand. Then, once, say what would remove the step.
+
+    Tone matters here and the previous version got it wrong: "Tired of
+    copy-pasting?" is an advert. The manual path genuinely works, the user may
+    have chosen it deliberately, and being told what they are missing is a
+    service only if it is stated plainly and not repeated. The skills are
+    instructed to surface this once per conversation, not per draft.
+
+    It also used to offer only the API-key route. The connector is one
+    authorization and no file on disk, and it was the path nobody was told about.
     """
     return f"""✅ Draft approved. Copy the text below and paste it as a {kind} on LinkedIn:
 
@@ -113,18 +139,16 @@ def manual_mode_message(draft_text: str, target_url: str, kind: str = "comment")
 
 ---
 
-💡 **Tired of copy-pasting?** Set up auto-posting in 2 minutes:
+Pasting by hand works fine and nothing here depends on changing it. If you would
+rather this went out on approval, there are two ways:
 
-1. Sign up free at {PUBLORA_SIGNUP_URL}  (15 LinkedIn posts/month on free tier)
-2. In Publora, connect your LinkedIn account (Channels → Add Channel)
-3. Copy your API key (API section in sidebar)
-4. Add to `.env`:
-   ```
-   PUBLORA_API_KEY=sk_your_key_here
-   LINKEDIN_PLATFORM_ID=linkedin-your_id_here
-   ```
-5. Next time you approve a draft, it auto-publishes.
-"""
+- **On claude.ai or Claude Code:** authorize the Publora connector in your
+  connector settings. One click, no key on disk, nothing to rotate.
+- **Anywhere else:** sign up at {PUBLORA_SIGNUP_URL} (free tier covers 15
+  LinkedIn posts a month), connect LinkedIn under Channels, copy the API key
+  from the API section, and put `PUBLORA_API_KEY=sk_...` in `.env`. The bundle
+  works the platform id out from the key on its own.
+{_half_configured()}"""
 
 
 def signup_nudge() -> str:
@@ -178,6 +202,14 @@ def publish(
 
         client = PubloraClient()
         platform_id = kwargs.get("platform_id") or os.getenv("LINKEDIN_PLATFORM_ID")
+        if not platform_id:
+            # Derivable from the key, so do not make the user fetch it by hand.
+            # Only when the account has exactly one LinkedIn channel: with
+            # several, picking one would publish to the wrong account.
+            try:
+                platform_id = client.resolve_linkedin_platform_id()
+            except Exception:
+                platform_id = None                # stay on the documented path
 
         if kind in ("comment", "reply"):
             post_urn = kwargs["post_urn"]
@@ -336,7 +368,7 @@ def repost(
 # that URL straight to `publish(..., media_urls=[url])`.
 # ─────────────────────────────────────────────────────────────────
 
-PIXFARO_SIGNUP_URL = "https://pixfaro.com"
+PIXFARO_SIGNUP_URL = "https://api.pixfaro.com/signup?ref=linkedin-skills"
 
 # Warn (don't block) when the prepaid balance drops below this, so a run
 # doesn't silently drain the account.
@@ -367,6 +399,35 @@ def image_backend() -> Literal["pixfaro", "manual"]:
     if os.getenv("PIXFARO_TOKEN") or os.getenv("PIXFARO_API_KEY"):
         return "pixfaro"
     return "manual"
+
+
+def _unloaded_token_note() -> str:
+    """The case that looked exactly like "no key": a .env in the expected place
+    DOES define PIXFARO_TOKEN, but it never reached the environment (python-dotenv
+    missing, or the process started elsewhere). Until now that user was told
+    "get a key" — the step they had already done. Name the file and the fix
+    instead of repeating the pitch."""
+    from ._env import find_unloaded_token_file
+
+    path = find_unloaded_token_file()
+    if not path:
+        return ""
+    return (
+        f"\n\n> **Your Pixfaro key is set but was not loaded.** `{path}` defines "
+        "PIXFARO_TOKEN, yet it is not in the environment. Usually that means "
+        "`python-dotenv` is not installed (`pip install python-dotenv`) or the "
+        "agent started from a different folder. Fix that and try again - you do "
+        "not need a new key.\n"
+    )
+
+
+def _verify_note() -> str:
+    """One line telling the user how to prove the key works, from the same folder."""
+    return (
+        "\nAfter adding it, run `python3 scripts/check_config.py` in the linkedin-skills "
+        "folder: it calls Pixfaro's GET /v1/key and prints the key's name and scope when "
+        "the key is right."
+    )
 
 
 _PIXFARO_CLIENT = None
@@ -400,13 +461,17 @@ def manual_illustration_message(prompt: str, aspect_ratio: str) -> str:
         "Image prompt:\n"
         f"{prompt}\n\n"
         f"Tip: a Pixfaro key ({PIXFARO_SIGNUP_URL}) lets me generate + attach "
-        "the illustration in one step, with your brand handle/color overlaid."
+        "the illustration in one step, with your brand handle/color overlaid. "
+        "Put it as `PIXFARO_TOKEN=pf_live_...` in `.env` at the root of the "
+        "linkedin-skills folder (next to its README)."
+        + _verify_note()
+        + _unloaded_token_note()
     )
 
 
 def manual_edit_message(instruction: str) -> str:
     """Shown when no Pixfaro key is set and the user asks to edit an image."""
-    return (
+    return _unloaded_token_note().lstrip("\n") + (
         "No Pixfaro key set, so I can't edit the image for you.\n"
         "Re-generate or edit it yourself, then paste the new URL.\n\n"
         "Edit instruction:\n"
@@ -549,15 +614,168 @@ def refine(
 
 
 def available_models() -> Optional[list[dict[str, Any]]]:
-    """Live Pixfaro model catalog (id, best_for, latency, price tiers), or None
-    in manual mode / on error. Use this to show current pricing instead of
-    hard-coding it."""
+    """Live Pixfaro model catalog (id, best_for, latency, price tiers).
+
+    Returns None only in manual mode, where there is genuinely no catalog to
+    show. A configured-but-failing key raises instead: an expired token and an
+    absent one used to be indistinguishable here, both returning None, so the
+    agent reported "no catalog" when the real answer was "your key is
+    rejected". Callers wanting the old behaviour can catch PixfaroError.
+    """
+    if image_backend() == "manual":
+        return None
+    return _pixfaro_client().list_models()
+
+
+# ─────────────────────────────────────────────────────────────────
+# DESIGN TEMPLATES (Pixfaro renders) — typeset cards, not model art.
+# A quote-card's text is HTML-typeset server-side, so it is pixel-crisp
+# every time; use `card`/`quote_card` for text-led visuals and keep
+# `illustrate` for scenes. Same result shape, same publish flow.
+# ─────────────────────────────────────────────────────────────────
+
+
+def manual_card_message(template: str, slots: dict[str, Any], size: str) -> str:
+    """Shown when no Pixfaro key is set and the user asks for a card."""
+    lines = "\n".join(f"  {k}: {v}" for k, v in slots.items())
+    return (
+        "No Pixfaro key set, so I can't render the card for you.\n"
+        f"Make a {size} card yourself (any design tool) with this content, "
+        "then paste the URL and I'll attach it to the post.\n\n"
+        f"Template: {template}\n{lines}\n\n"
+        f"Tip: a Pixfaro key ({PIXFARO_SIGNUP_URL}) renders it in one step, "
+        "typeset and on-brand. Put it as `PIXFARO_TOKEN=pf_live_...` in `.env` at "
+        "the root of the linkedin-skills folder."
+        + _verify_note()
+        + _unloaded_token_note()
+    )
+
+
+def card(
+    template: str,
+    slots: dict[str, Any],
+    *,
+    size: Optional[str] = None,
+    style: Optional[Any] = None,
+    overlay: Optional[Any] = None,
+    **kwargs: Any,
+) -> dict[str, Any]:
+    """Render a design template via the active image backend.
+
+    The template analogue of `illustrate()`: returns the same result dict, so
+    the URL flows straight into `publish(..., media_urls=[r["url"]])`. Discover
+    templates + slots with `available_templates()`.
+
+    Args:
+        template: Template id (e.g. "quote-card", "post-card").
+        slots: Slot values keyed by slot name. Text slots `name`/`handle` and
+            the `avatar` image slot accept "default" to pull from the account's
+            Pixfaro brand identity.
+        size: Template size id ("1:1", "4:5", "16:9", "og"); server default
+            when omitted.
+        style: "auto" (server rotates looks between calls), "brand", or an
+            explicit {palette, font, layout, shadow} dict.
+        overlay: Corner overlay dict as in `illustrate`, or "default" for the
+            account's saved brand kit.
+    """
+    if image_backend() == "manual":
+        return {"backend": "manual", "message": manual_card_message(template, slots, size or "1:1")}
+
+    client = _pixfaro_client()
+    data = client.render(
+        template,
+        slots,
+        size=size,
+        style=style,
+        overlay=overlay,
+        scale=kwargs.get("scale"),
+        force_refresh=kwargs.get("force_refresh", False),
+    )
+    return _image_result(data, template)
+
+
+def quote_card(
+    quote: str,
+    *,
+    name: Optional[str] = None,
+    handle: Optional[str] = None,
+    avatar: Optional[str] = None,
+    size: str = "1:1",
+    style: Optional[Any] = None,
+    **kwargs: Any,
+) -> dict[str, Any]:
+    """Render the pulled hook line as a typeset quote-card.
+
+    Sugar over `card("quote-card", ...)` — the common LinkedIn case. Put the
+    HOOK LINE here rather than into an `illustrate` prompt or overlay: the
+    template typesets it, so long lines wrap and stay sharp.
+
+    `name`/`handle`/`avatar` are optional attribution; pass "default" to pull
+    them from the account's Pixfaro brand identity. `quote` is capped at 280
+    chars by the template.
+    """
+    slots: dict[str, Any] = {"quote": quote}
+    if name:
+        slots["name"] = name
+    if handle:
+        slots["handle"] = handle
+    if avatar:
+        slots["avatar"] = avatar
+    return card("quote-card", slots, size=size, style=style, **kwargs)
+
+
+def available_templates() -> Optional[list[dict[str, Any]]]:
+    """Live Pixfaro template catalog (id, slots, sizes, price), or None in
+    manual mode / on error. The catalog endpoint is public and free."""
     if image_backend() == "manual":
         return None
     try:
-        return _pixfaro_client().list_models()
+        return _pixfaro_client().list_templates()
     except Exception:
         return None
+
+
+def brand_logo(path: str, *, name: Optional[str] = None) -> dict[str, Any]:
+    """One-time brand-logo upload; the returned `logo_id` makes `overlay`
+    stamp a real logo instead of text.
+
+    On success returns {"backend": "pixfaro", "logo": {"id": "logo_...", ...}}
+    — save the id under "Logo" in the Voice & Brand Profile §6, then pass
+    `overlay={"logo_id": ..., "position": ...}` to `illustrate`/`card`.
+
+    Uploading needs a FULL-scope key; with a generate-scope key Pixfaro
+    answers 403 and the returned message says to upload in the dashboard
+    (pixfaro.com/dashboard) instead — generation keeps working either way.
+    """
+    if image_backend() == "manual":
+        return {
+            "backend": "manual",
+            "message": (
+                "No Pixfaro key set, so I can't upload the logo. "
+                f"Sign up at {PIXFARO_SIGNUP_URL}, then either upload it in the "
+                "dashboard or set PIXFARO_TOKEN and retry."
+            ),
+        }
+
+    from .pixfaro_client import PixfaroError
+
+    client = _pixfaro_client()
+    try:
+        logo = client.upload_logo(path, name=name)
+    except PixfaroError as e:
+        if getattr(e, "status_code", None) == 403:
+            return {
+                "backend": "pixfaro",
+                "error": "insufficient_scope",
+                "message": (
+                    "This PIXFARO_TOKEN is generate-scope, and logo upload needs "
+                    "a full-scope key. Upload the logo once in the dashboard "
+                    "(pixfaro.com/dashboard) and paste the logo_id into the "
+                    "Voice & Brand Profile §6 — or switch to a full-scope key."
+                ),
+            }
+        raise
+    return {"backend": "pixfaro", "logo": logo}
 
 
 if __name__ == "__main__":
